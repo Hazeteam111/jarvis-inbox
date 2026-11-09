@@ -41,12 +41,33 @@ const DEEPSEEK_MODEL = "deepseek-chat";
 /** Таймаут запроса к DeepSeek, чтобы роут не висел бесконечно. */
 const DEEPSEEK_TIMEOUT_MS = 60_000;
 
-const CATEGORIES = ["music", "business", "task", "thought"] as const;
+/** Базовые разделы канбана: к ним приводятся привычные названия. */
+const CATEGORY_ALIASES: Record<string, string> = {
+  music: "music",
+  музыка: "music",
+  музло: "music",
+  мотив: "music",
+  business: "business",
+  бизнес: "business",
+  task: "task",
+  tasks: "task",
+  задача: "task",
+  задачи: "task",
+  дела: "task",
+  thought: "thought",
+  thoughts: "thought",
+  мысль: "thought",
+  мысли: "thought",
+  дневник: "thought",
+};
 
-type Category = (typeof CATEGORIES)[number];
+/** Ограничения на длину названий, чтобы LLM не записала в поле целый абзац. */
+const MAX_CATEGORY_LENGTH = 40;
+const MAX_SUBCATEGORY_LENGTH = 40;
 
 type Classification = {
-  category: Category;
+  category: string;
+  subcategory: string | null;
   title: string;
   cleaned_text: string;
   action_date: string | null;
@@ -110,16 +131,31 @@ function logStepError(
 
 /** Системный промпт классификатора. Время фиксируется на момент запроса. */
 function buildSystemPrompt(): string {
-  return `Ты — персональный секретарь и классификатор входящих мыслей. Текущее время ISO: ${new Date().toISOString()}.
-Проанализируй входящую мысль и распредели по категориям:
-- 'music': автор напевает мелодию, рифмы, гармонию, темп, слова трека или говорит 'придумал мотив/мелодию'.
-- 'business': бизнес-идеи, коммерция, монетизация, оптимизация процессов, продажи.
-- 'task': конкретная задача или бытовое дело (особенно если есть фразы вроде 'надо сделать', 'поставь напоминание на 14:00').
-- 'thought': пассивные рассуждения, личные мысли, дневник.
+  return `Ты — персональный секретарь Jarvis: превращаешь устную мысль в структурированную заметку для канбана. Текущее время ISO: ${new Date().toISOString()}.
 
-Верни строго JSON объект:
+ШАГ 1. Определи раздел (category).
+Базовые разделы:
+- "music": напевает мелодию, мотив, рифмы, гармонию, темп, текст песни.
+- "business": бизнес-идеи, коммерция, монетизация, процессы, продажи, каналы сбыта.
+- "task": конкретное действие или бытовое дело (маркеры: «надо», «сделай», «напомни», «позвони», «купи», «поставь напоминание на 14:00»).
+- "thought": рассуждения, личные мысли, дневник, наблюдения.
+
+Динамические разделы: если человек прямо создаёт новый раздел («создай раздел X и запиши…», «заведи категорию X», «запиши в раздел X»), верни category = "X" — ровно то имя, которое назвал человек, без слов «раздел» и «категория». Не придумывай новые разделы сам: если человек раздел не назвал, используй только базовые.
+
+ШАГ 2. Определи подкатегорию (subcategory) — короткий тег внутри раздела, 1–2 слова в нижнем регистре:
+- music → "мотив", "текст", "аранжировка", "референс";
+- business → тема сделки или канала: "ноутбуки", "avito", "маркетплейс", "найм";
+- task → бытовая область: "дом", "звонки", "покупки", "здоровье";
+- thought → тема рассуждения: "идея", "наблюдение", "дневник";
+- для динамического раздела — тема заметки внутри него.
+Если подкатегория не очевидна, верни "общее".
+
+ШАГ 3. Приведи текст в порядок: убери мычание, повторы и слова-паразиты, сохрани смысл и факты. Если назван дедлайн («завтра в 15:00», «в пятницу»), вычисли ISO-дату относительно текущего времени.
+
+Верни строго JSON без пояснений:
 {
-  "category": "music" | "business" | "task" | "thought",
+  "category": "music | business | task | thought | <новая категория>",
+  "subcategory": "короткий тег подкатегории",
   "title": "Короткий емкий заголовок (до 5 слов)",
   "cleaned_text": "Текст мысли без мычания, пауз и слов-паразитов",
   "action_date": "ISO-дата дедлайна если была названа, иначе null"
@@ -225,10 +261,61 @@ async function transcribeAudio(audio: File): Promise<string> {
   return transcript.trim();
 }
 
-function isCategory(value: unknown): value is Category {
-  return (
-    typeof value === "string" && (CATEGORIES as readonly string[]).includes(value)
-  );
+/**
+ * Приводит раздел к каноническому ключу: привычные названия — к `music` /
+ * `business` / `task` / `thought`, незнакомое имя сохраняется как есть
+ * (динамические разделы вроде «Спорт»).
+ */
+function normalizeCategory(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const raw = value.replace(/\s+/g, " ").trim();
+
+  if (!raw || raw.includes("|") || raw.includes("<")) {
+    return null;
+  }
+
+  const normalized = raw
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[.,;:!?]/g, "")
+    .trim();
+  const exact = CATEGORY_ALIASES[normalized];
+
+  if (exact) {
+    return exact;
+  }
+
+  // «Музыка & Мотивы», «Задачи на неделю» — подсказкой служит первое слово.
+  const [firstWord] = normalized.split(/\s+/);
+  const byFirstWord = firstWord ? CATEGORY_ALIASES[firstWord] : undefined;
+
+  if (byFirstWord) {
+    return byFirstWord;
+  }
+
+  return raw.slice(0, MAX_CATEGORY_LENGTH);
+}
+
+/** Подкатегория — короткий тег в нижнем регистре; мусорные значения отбрасываются. */
+function normalizeSubcategory(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const tag = value
+    .replace(/\s+/g, " ")
+    .replace(/^#+/, "")
+    .trim()
+    .toLowerCase();
+
+  if (!tag || ["null", "none", "n/a", "-", "нет"].includes(tag)) {
+    return null;
+  }
+
+  return tag.slice(0, MAX_SUBCATEGORY_LENGTH);
 }
 
 function asNonEmptyString(value: unknown): string | null {
@@ -273,6 +360,7 @@ function extractJsonPayload(content: string): string {
 function fallbackClassification(rawTranscript: string): Classification {
   return {
     category: "thought",
+    subcategory: null,
     title: buildTitle(rawTranscript),
     cleaned_text: rawTranscript,
     action_date: null,
@@ -312,15 +400,17 @@ function parseClassification(
   }
 
   const candidate = payload as Record<string, unknown>;
+  const category = normalizeCategory(candidate.category);
 
-  if (!isCategory(candidate.category)) {
+  if (!category) {
     logStepError("DeepSeek вернул неизвестную категорию, использую fallback", {
       category: candidate.category,
     });
   }
 
   return {
-    category: isCategory(candidate.category) ? candidate.category : fallback.category,
+    category: category ?? fallback.category,
+    subcategory: normalizeSubcategory(candidate.subcategory),
     title: asNonEmptyString(candidate.title) ?? fallback.title,
     cleaned_text: asNonEmptyString(candidate.cleaned_text) ?? fallback.cleaned_text,
     action_date: normalizeActionDate(candidate.action_date),
@@ -504,6 +594,7 @@ export async function POST(request: Request) {
       raw_transcript: rawTranscript,
       title: classification.title,
       category: classification.category,
+      subcategory: classification.subcategory,
       cleaned_text: classification.cleaned_text,
       action_date: classification.action_date,
       status: "inbox",
