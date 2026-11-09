@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Manrope, Unbounded } from "next/font/google";
 import "./globals.css";
 
@@ -19,6 +19,14 @@ const manrope = Manrope({
   subsets: ["latin", "cyrillic"],
   display: "swap",
 });
+
+/** PWA-режим: ширина по устройству, зум заблокирован. */
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+};
 
 export const metadata: Metadata = {
   title: "Jarvis Inbox",

@@ -799,7 +799,7 @@ export default function Home() {
   const statusLine = PHASE_TEXT[phase];
 
   return (
-    <main className="relative flex min-h-dvh flex-1 flex-col bg-bg font-sans text-ink antialiased">
+    <main className="no-scrollbar relative flex h-dvh flex-1 flex-col overflow-y-auto overscroll-contain bg-bg font-sans text-ink antialiased">
       <div aria-hidden className="app-aurora">
         <span className="app-glow app-glow-1" />
         <span className="app-glow app-glow-2" />
@@ -823,6 +823,10 @@ export default function Home() {
                 Голос → Deepgram nova-3 → DeepSeek → канбан
               </p>
             </div>
+
+            <span className="select-none rounded border border-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/30">
+              v1.0.1
+            </span>
           </div>
 
           <nav aria-label="Разделы приложения" className="seg shrink-0">
