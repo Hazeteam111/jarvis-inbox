@@ -44,6 +44,39 @@ type MutationResponse =
   | { status: "ok"; data: { id: string } }
   | { status: "error"; error: string };
 
+type TelegramSettings = {
+  bot_token: string;
+  chat_id: string;
+  is_active: boolean;
+  summary_time: string;
+  last_summary_date: string | null;
+};
+
+type TelegramSettingsForm = {
+  bot_token: string;
+  chat_id: string;
+  is_active: boolean;
+  summary_time: string;
+};
+
+type TelegramSettingsResponse =
+  | { status: "ok"; data: TelegramSettings }
+  | { status: "error"; error: string };
+
+type DailySummaryResponse =
+  | {
+      status: "ok";
+      data: {
+        sent_at: string;
+        date: string;
+        summary_time: string;
+        notes: number;
+        forced: boolean;
+      };
+    }
+  | { status: "skipped"; reason: string; detail?: string }
+  | { status: "error"; error: string };
+
 type CategoryStyle = {
   title: string;
   emoji: string;
@@ -62,8 +95,21 @@ type ColumnData = {
 
 const VOICE_INBOX_ENDPOINT = "/api/voice-inbox";
 const VOICE_NOTES_ENDPOINT = "/api/voice-notes";
+const TELEGRAM_SETTINGS_ENDPOINT = "/api/settings/telegram";
+const DAILY_SUMMARY_ENDPOINT = "/api/cron/daily-summary";
 const AUDIO_FIELD = "audio";
 const AUDIO_FILE_NAME = "record.m4a";
+
+/** Время вечернего отчёта по умолчанию — как в API и в таблице app_settings. */
+const DEFAULT_SUMMARY_TIME = "21:30";
+
+/** Расшифровка причин, по которым крон не отправил отчёт. */
+const SUMMARY_SKIP_TEXT: Record<string, string> = {
+  not_configured: "Не заданы токен бота или chat_id — отчёт некуда отправлять.",
+  inactive: "Отправка ежедневного отчёта выключена тумблером.",
+  not_scheduled_time: "Сейчас не время отчёта — автоматическая отправка пропущена.",
+  already_sent_today: "Отчёт за сегодня уже отправлен.",
+};
 
 /** Значение «все подкатегории» в чипах колонки. */
 const ALL_SUBCATEGORIES = "__all";
@@ -74,50 +120,54 @@ const UNCATEGORIZED_KEY = "без раздела";
 /** Порядок известных разделов; новые разделы идут после них по алфавиту. */
 const CATEGORY_ORDER = ["music", "business", "task", "thought"];
 
-/** Оформление известных разделов; незнакомые получают нейтральный стиль. */
+/**
+ * Оформление известных разделов; незнакомые получают нейтральный стиль.
+ * Цвета — Apple System Colors из дизайн-системы: #BF5AF2, #FF9F0A, #0A84FF,
+ * #30D158. Полупрозрачные заливки и кромки считаются от того же HEX.
+ */
 const CATEGORY_STYLES: Record<string, CategoryStyle> = {
   music: {
     title: "Музыка",
     emoji: "🎵",
-    chip: "border-violet-400/30 bg-violet-500/15 text-violet-200",
-    text: "text-violet-300",
-    bar: "from-violet-400/70",
+    chip: "border-[#bf5af2]/35 bg-[#bf5af2]/15 text-[#dcb0ff]",
+    text: "text-[#dcb0ff]",
+    bar: "from-[#bf5af2]/70",
   },
   business: {
     title: "Бизнес",
     emoji: "💼",
-    chip: "border-amber-400/30 bg-amber-500/15 text-amber-200",
-    text: "text-amber-300",
-    bar: "from-amber-400/70",
+    chip: "border-[#ff9f0a]/35 bg-[#ff9f0a]/15 text-[#ffc46b]",
+    text: "text-[#ffc46b]",
+    bar: "from-[#ff9f0a]/70",
   },
   task: {
     title: "Задачи",
     emoji: "⏱",
-    chip: "border-sky-400/30 bg-sky-500/15 text-sky-200",
-    text: "text-sky-300",
-    bar: "from-sky-400/70",
+    chip: "border-[#0a84ff]/35 bg-[#0a84ff]/15 text-[#6ab7ff]",
+    text: "text-[#6ab7ff]",
+    bar: "from-[#0a84ff]/70",
   },
   thought: {
     title: "Мысли",
     emoji: "💡",
-    chip: "border-emerald-400/30 bg-emerald-500/15 text-emerald-200",
-    text: "text-emerald-300",
-    bar: "from-emerald-400/70",
+    chip: "border-[#30d158]/40 bg-[#30d158]/15 text-[#7ee6a0]",
+    text: "text-[#7ee6a0]",
+    bar: "from-[#30d158]/70",
   },
 };
 
 const FALLBACK_CATEGORY_STYLE: CategoryStyle = {
   title: "Раздел",
   emoji: "🗂",
-  chip: "border-zinc-500/30 bg-zinc-500/15 text-zinc-200",
-  text: "text-zinc-300",
-  bar: "from-zinc-400/70",
+  chip: "border-stroke-2 bg-panel text-muted",
+  text: "text-muted",
+  bar: "from-white/40",
 };
 
 /** Стили сегментированного переключателя «Канбан / Корзина». */
-const SEGMENT_BASE = "inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition";
-const SEGMENT_ACTIVE = "bg-zinc-100 text-zinc-900 shadow-sm shadow-black/30";
-const SEGMENT_IDLE = "text-zinc-400 hover:text-zinc-200";
+const SEGMENT_BASE = "seg-btn";
+const SEGMENT_ACTIVE = "seg-btn-on";
+const SEGMENT_IDLE = "";
 
 /** Порядок важен: первый поддерживаемый браузером тип и будет использован. */
 const MIME_CANDIDATES = [
@@ -298,6 +348,7 @@ export default function Home() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [view, setView] = useState<ViewMode>("board");
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [activeColumn, setActiveColumn] = useState<string | null>(null);
   const [subFilters, setSubFilters] = useState<Record<string, string>>({});
@@ -748,35 +799,33 @@ export default function Home() {
   const statusLine = PHASE_TEXT[phase];
 
   return (
-    <main className="relative flex min-h-dvh flex-1 flex-col bg-zinc-950 text-zinc-100 antialiased">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-x-0 top-0 h-80 bg-[radial-gradient(60%_100%_at_50%_0%,rgba(110,120,255,0.18),transparent_72%)]"
-      />
+    <main className="relative flex min-h-dvh flex-1 flex-col bg-bg font-sans text-ink antialiased">
+      <div aria-hidden className="app-aurora">
+        <span className="app-glow app-glow-1" />
+        <span className="app-glow app-glow-2" />
+        <span className="app-glow app-glow-3" />
+      </div>
 
-      <header className="sticky top-0 z-30 border-b border-zinc-800/50 bg-zinc-950/70 backdrop-blur-xl">
+      <header className="glass sticky top-0 z-30 rounded-b-[24px] border-x-0 border-t-0">
         <div className="mx-auto flex w-full max-w-[1700px] items-center gap-2 px-3 py-2.5 sm:gap-3 sm:px-6">
           <div className="mr-auto flex min-w-0 items-center gap-2.5">
             <span
               aria-hidden
-              className="grid h-9 w-9 shrink-0 place-items-center rounded-2xl border border-zinc-700/60 bg-gradient-to-br from-zinc-700/50 to-zinc-900 text-base shadow-lg shadow-black/30"
+              className="glass-lite grid h-9 w-9 shrink-0 place-items-center rounded-[15px] text-base"
             >
               🤖
             </span>
             <div className="min-w-0">
-              <h1 className="truncate text-[15px] font-semibold tracking-tight sm:text-base">
-                Jarvis Inbox
+              <h1 className="truncate font-display text-[15px] font-semibold tracking-[0.06em] sm:text-base">
+                Jarvis Inbox<span className="opacity-45">.</span>
               </h1>
-              <p className="hidden truncate text-[11px] text-zinc-500 sm:block">
+              <p className="hidden truncate text-[10px] uppercase tracking-[0.14em] text-dim sm:block">
                 Голос → Deepgram nova-3 → DeepSeek → канбан
               </p>
             </div>
           </div>
 
-          <nav
-            aria-label="Разделы приложения"
-            className="flex shrink-0 items-center gap-1 rounded-full border border-zinc-800/60 bg-zinc-900/60 p-1 backdrop-blur-xl"
-          >
+          <nav aria-label="Разделы приложения" className="seg shrink-0">
             <button
               type="button"
               onClick={() => setView("board")}
@@ -798,7 +847,7 @@ export default function Home() {
                 <span
                   className={cn(
                     "rounded-full px-1.5 text-[10px] tabular-nums",
-                    view === "trash" ? "bg-zinc-900/15 text-zinc-700" : "bg-zinc-800 text-zinc-300",
+                    view === "trash" ? "bg-black/10 text-black/55" : "bg-white/10 text-ink/70",
                   )}
                 >
                   {trashNotes.length}
@@ -811,18 +860,28 @@ export default function Home() {
 
           <button
             type="button"
+            onClick={() => setIsSettingsOpen(true)}
+            title="Настройки Telegram"
+            aria-label="Настройки Telegram"
+            className="icon-btn"
+          >
+            <SettingsIcon className="h-4 w-4" />
+          </button>
+
+          <button
+            type="button"
             onClick={() => void loadNotes()}
             disabled={isRefreshing}
             title="Обновить список заметок"
             aria-label="Обновить список заметок"
-            className="grid h-10 w-10 shrink-0 place-items-center rounded-full border border-zinc-800/60 bg-zinc-900/60 text-zinc-300 backdrop-blur-xl transition hover:border-zinc-700 hover:text-zinc-100 disabled:opacity-60"
+            className="icon-btn"
           >
             <RefreshIcon className={cn("h-4 w-4", isRefreshing && "animate-spin")} />
           </button>
         </div>
 
         {statusLine ? (
-          <div className="mx-auto flex w-full max-w-[1700px] items-center gap-2 px-3 pb-2.5 text-[11px] text-zinc-500 sm:px-6 sm:text-xs">
+          <div className="mx-auto flex w-full max-w-[1700px] items-center gap-2 px-3 pb-2.5 text-[11px] text-muted sm:px-6 sm:text-xs">
             {isProcessing ? <Spinner className="h-3.5 w-3.5" /> : null}
             <span role="status" aria-live="polite" className="truncate">
               {statusLine}
@@ -835,7 +894,7 @@ export default function Home() {
         {recordError ? (
           <div
             role="alert"
-            className="mt-3 flex items-start gap-3 rounded-2xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs leading-relaxed text-red-200 backdrop-blur-xl"
+            className="glass-lite mt-3 flex items-start gap-3 rounded-[18px] border border-[#ff453a]/30 px-3.5 py-2.5 text-xs leading-relaxed text-[#ffb3ae]"
           >
             <span className="flex-1">{recordError}</span>
             <button
@@ -845,7 +904,7 @@ export default function Home() {
                 setPhase("idle");
               }}
               aria-label="Скрыть сообщение об ошибке"
-              className="shrink-0 text-red-300/80 transition hover:text-red-100"
+              className="shrink-0 font-bold text-[#ff8f86] transition hover:text-white"
             >
               ✕
             </button>
@@ -855,13 +914,13 @@ export default function Home() {
         {loadError ? (
           <div
             role="alert"
-            className="mt-3 flex flex-col gap-2 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs leading-relaxed text-amber-200 backdrop-blur-xl sm:flex-row sm:items-center"
+            className="glass-lite mt-3 flex flex-col gap-2 rounded-[18px] border border-[#ffd60a]/30 px-3.5 py-2.5 text-xs leading-relaxed text-[#ffe27a] sm:flex-row sm:items-center"
           >
             <span className="flex-1">{loadError}</span>
             <button
               type="button"
               onClick={() => void loadNotes()}
-              className="self-start rounded-full border border-amber-400/30 px-3 py-1 font-medium text-amber-100 transition hover:bg-amber-500/15 sm:self-auto"
+              className="chip self-start border-[#ffd60a]/30 text-[#ffe27a] hover:text-white sm:self-auto"
             >
               Повторить
             </button>
@@ -869,7 +928,7 @@ export default function Home() {
         ) : null}
 
         <div className="mt-4 flex flex-wrap items-center gap-2">
-          <div className="flex rounded-full border border-zinc-800/60 bg-zinc-900/60 p-1 backdrop-blur-xl">
+          <div className="seg">
             {STATUS_FILTERS.map((filter) => (
               <button
                 key={filter.id}
@@ -877,17 +936,15 @@ export default function Home() {
                 onClick={() => setStatusFilter(filter.id)}
                 aria-pressed={statusFilter === filter.id}
                 className={cn(
-                  "rounded-full px-3 py-1.5 text-xs font-medium transition",
-                  statusFilter === filter.id
-                    ? "bg-zinc-100 text-zinc-900"
-                    : "text-zinc-500 hover:text-zinc-200",
+                  SEGMENT_BASE,
+                  statusFilter === filter.id ? SEGMENT_ACTIVE : SEGMENT_IDLE,
                 )}
               >
                 {filter.label}
                 <span
                   className={cn(
-                    "ml-1.5 tabular-nums",
-                    statusFilter === filter.id ? "text-zinc-500" : "text-zinc-600",
+                    "tabular-nums",
+                    statusFilter === filter.id ? "text-black/45" : "text-dim",
                   )}
                 >
                   {filterCounts[filter.id]}
@@ -896,14 +953,14 @@ export default function Home() {
             ))}
           </div>
 
-          <p className="ml-auto hidden text-[11px] text-zinc-600 sm:block">
+          <p className="ml-auto hidden text-[11px] text-dim sm:block">
             {lastLoadedAt ? `обновлено ${lastLoadedAt}` : null}
           </p>
         </div>
 
         {view === "board" ? (
           <>
-            <div className="mt-3 flex gap-2 overflow-x-auto pb-1 [scrollbar-width:none] lg:hidden [&::-webkit-scrollbar]:hidden">
+            <div className="no-scrollbar mt-3 flex gap-2 overflow-x-auto pb-1 lg:hidden">
               {columns.map((column) => {
                 const isActive = activeColumnKey === column.key;
 
@@ -912,12 +969,7 @@ export default function Home() {
                     key={column.key}
                     type="button"
                     onClick={() => setActiveColumn(column.key)}
-                    className={cn(
-                      "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition",
-                      isActive
-                        ? column.style.chip
-                        : "border-zinc-800/60 bg-zinc-900/60 text-zinc-400 hover:text-zinc-200",
-                    )}
+                    className={cn("chip shrink-0", isActive ? column.style.chip : "")}
                   >
                     <span aria-hidden>{column.style.emoji}</span>
                     {column.style.title}
@@ -953,20 +1005,24 @@ export default function Home() {
         {actionError ? (
           <div
             role="alert"
-            className="mt-4 flex items-center gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-200 backdrop-blur-xl"
+            className="glass-lite mt-4 flex items-center gap-3 rounded-[18px] border border-[#ffd60a]/30 px-3.5 py-2.5 text-xs text-[#ffe27a]"
           >
             <span className="flex-1">{actionError}</span>
             <button
               type="button"
               onClick={() => setActionError(null)}
-              className="shrink-0 text-amber-300/80 transition hover:text-amber-100"
+              className="shrink-0 font-bold text-[#ffe27a]/80 transition hover:text-white"
             >
               Закрыть
             </button>
           </div>
         ) : null}
 
-        <p className="mt-8 text-center text-[11px] text-zinc-600">
+        {isSettingsOpen ? (
+          <TelegramSettingsModal onClose={() => setIsSettingsOpen(false)} />
+        ) : null}
+
+        <p className="mt-8 text-center text-[10px] uppercase tracking-[0.14em] text-dim">
           Микрофон → Supabase Storage → Deepgram nova-3 → DeepSeek → voice_notes
         </p>
       </div>
@@ -997,11 +1053,8 @@ function Board({
     return (
       <div className="mt-4 grid grid-cols-1 gap-3.5 lg:grid-cols-[repeat(auto-fit,minmax(19rem,1fr))]">
         {[0, 1, 2, 3].map((index) => (
-          <div
-            key={index}
-            className="flex flex-col gap-2.5 rounded-2xl border border-zinc-800/50 bg-zinc-900/40 p-3 backdrop-blur-xl"
-          >
-            <div className="h-3 w-24 animate-pulse rounded-full bg-zinc-800" />
+          <div key={index} className="surface flex flex-col gap-2.5 p-3">
+            <div className="h-3 w-24 animate-pulse rounded-full bg-white/10" />
             <CardSkeleton />
             <CardSkeleton />
           </div>
@@ -1012,12 +1065,12 @@ function Board({
 
   if (columns.length === 0) {
     return (
-      <div className="mt-4 rounded-3xl border border-dashed border-zinc-800/70 bg-zinc-900/40 px-6 py-16 text-center backdrop-blur-xl">
+      <div className="surface mt-4 rounded-[28px] border-dashed px-6 py-16 text-center">
         <p aria-hidden className="text-3xl">
           🎙
         </p>
-        <p className="mt-3 text-sm font-medium text-zinc-300">Пока пусто</p>
-        <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-zinc-500">
+        <p className="mt-3 font-display text-sm font-semibold text-ink">Пока пусто</p>
+        <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-muted">
           Нажмите «Записать» в шапке — заметка сама разложится по разделам и подкатегориям.
         </p>
       </div>
@@ -1034,18 +1087,20 @@ function Board({
             key={column.key}
             aria-label={column.style.title}
             className={cn(
-              "flex-col overflow-hidden rounded-2xl border border-zinc-800/50 bg-zinc-900/40 backdrop-blur-xl",
+              "surface flex-col overflow-hidden rounded-card",
               activeColumnKey === column.key ? "flex" : "hidden lg:flex",
             )}
           >
             <div className={cn("h-px w-full bg-gradient-to-r to-transparent", column.style.bar)} />
 
-            <header className="flex items-center gap-2 px-4 pt-3">
+            <header className="flex items-center gap-2 px-4 pt-3.5">
               <span aria-hidden className="text-sm">
                 {column.style.emoji}
               </span>
-              <h2 className="truncate text-sm font-semibold text-zinc-200">{column.style.title}</h2>
-              <span className="ml-auto rounded-full bg-zinc-800/70 px-2 py-0.5 text-[11px] tabular-nums text-zinc-400">
+              <h2 className="truncate font-display text-[13px] font-semibold tracking-wide text-ink">
+                {column.style.title}
+              </h2>
+              <span className="ml-auto rounded-full border border-stroke bg-white/5 px-2 py-0.5 text-[11px] tabular-nums text-muted">
                 {column.notes.length}
               </span>
             </header>
@@ -1071,16 +1126,17 @@ function Board({
               </div>
             ) : null}
 
-            <div className="flex flex-col gap-2.5 p-3 lg:max-h-[calc(100dvh-17rem)] lg:overflow-y-auto lg:[scrollbar-width:thin]">
+            <div className="no-scrollbar flex flex-col gap-2.5 p-3 lg:max-h-[calc(100dvh-17rem)] lg:overflow-y-auto">
               {column.visibleNotes.length === 0 ? (
-                <p className="rounded-2xl border border-dashed border-zinc-800/60 px-3 py-8 text-center text-xs text-zinc-600">
+                <p className="rounded-[18px] border border-dashed border-stroke px-3 py-8 text-center text-xs text-dim">
                   {column.notes.length === 0 ? "Пока пусто" : "В этой подкатегории пусто"}
                 </p>
               ) : (
-                column.visibleNotes.map((note) => (
+                column.visibleNotes.map((note, index) => (
                   <NoteCard
                     key={note.id}
                     note={note}
+                    index={index}
                     isPending={pendingIds.includes(note.id)}
                     onToggleStatus={onToggleStatus}
                     onTrash={onTrash}
@@ -1097,11 +1153,13 @@ function Board({
 
 function NoteCard({
   note,
+  index,
   isPending,
   onToggleStatus,
   onTrash,
 }: {
   note: VoiceNote;
+  index: number;
   isPending: boolean;
   onToggleStatus: (note: VoiceNote) => Promise<void>;
   onTrash: (note: VoiceNote) => Promise<void>;
@@ -1114,18 +1172,16 @@ function NoteCard({
 
   return (
     <article
-      className={cn(
-        "rounded-2xl border border-zinc-800/60 bg-zinc-900/60 p-3.5 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.04),0_14px_30px_-24px_rgba(0,0,0,0.95)] backdrop-blur-xl transition hover:border-zinc-700/70 hover:bg-zinc-900/80",
-        isDone && "opacity-60",
-      )}
+      className={cn("surface surface-hover anim-rise p-3.5", isDone && "opacity-60")}
+      style={{ animationDelay: `${index * 34}ms` }}
     >
       <div className="flex items-center gap-2">
-        <time dateTime={note.created_at ?? undefined} className="truncate text-[11px] text-zinc-500">
+        <time dateTime={note.created_at ?? undefined} className="truncate text-[11px] text-dim">
           {formatNoteTime(note.created_at)}
         </time>
 
         {subcategory ? (
-          <span className="max-w-[9rem] truncate rounded-full border border-zinc-700/50 bg-zinc-800/60 px-2 py-0.5 text-[10px] font-medium text-zinc-400">
+          <span className="max-w-[9rem] truncate rounded-pill border border-stroke bg-white/[0.06] px-2 py-0.5 text-[10px] font-semibold text-muted">
             {subcategoryLabel(subcategory)}
           </span>
         ) : null}
@@ -1138,7 +1194,7 @@ function NoteCard({
             disabled={isPending}
             aria-label="Убрать в корзину"
             title="Убрать в корзину"
-            className="grid h-7 w-7 shrink-0 place-items-center rounded-full border border-zinc-800/70 bg-zinc-900/70 text-zinc-500 transition hover:border-red-500/40 hover:text-red-300 disabled:opacity-50"
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-full border border-stroke bg-white/5 text-dim transition hover:border-[#ff453a]/40 hover:text-[#ff8f86] disabled:opacity-50"
           >
             <TrashIcon className="h-3.5 w-3.5" />
           </button>
@@ -1147,15 +1203,15 @@ function NoteCard({
 
       <h3
         className={cn(
-          "mt-2 text-sm font-semibold leading-snug text-zinc-100",
-          isDone && "line-through decoration-zinc-500",
+          "mt-2 font-display text-[13.5px] font-semibold leading-snug tracking-tight text-ink",
+          isDone && "line-through decoration-white/35",
         )}
       >
         {noteTitle(note)}
       </h3>
 
       {text ? (
-        <p className="mt-1 line-clamp-5 whitespace-pre-line text-[13px] leading-relaxed text-zinc-400">
+        <p className="mt-1.5 line-clamp-5 whitespace-pre-line text-[13px] leading-relaxed text-muted">
           {text}
         </p>
       ) : null}
@@ -1163,10 +1219,10 @@ function NoteCard({
       {deadline ? (
         <p
           className={cn(
-            "mt-2 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ring-1 ring-inset",
+            "mt-2 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1 ring-inset",
             deadline.overdue
-              ? "bg-red-500/10 text-red-300 ring-red-500/25"
-              : "bg-sky-500/10 text-sky-300 ring-sky-500/25",
+              ? "bg-[#ff453a]/12 text-[#ff8f86] ring-[#ff453a]/30"
+              : "bg-[#0a84ff]/12 text-[#6ab7ff] ring-[#0a84ff]/30",
           )}
         >
           <ClockIcon className="h-3 w-3" />
@@ -1193,12 +1249,7 @@ function SubChip({
       type="button"
       onClick={onClick}
       aria-pressed={active}
-      className={cn(
-        "inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-medium transition",
-        active
-          ? "border-zinc-500/60 bg-zinc-100 text-zinc-900"
-          : "border-zinc-800/70 bg-zinc-900/60 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200",
-      )}
+      className={cn("chip px-2.5 py-1 text-[11px]", active ? "chip-on" : "")}
     >
       {children}
     </button>
@@ -1228,20 +1279,20 @@ function AudioPlayer({ src }: { src: string }) {
   }
 
   return (
-    <div className="mt-3 flex items-center gap-2.5 rounded-full border border-zinc-800/60 bg-zinc-950/50 py-1 pl-1 pr-3">
+    <div className="mt-3 flex items-center gap-2.5 rounded-pill border border-stroke bg-white/[0.04] py-1 pl-1 pr-3">
       <button
         type="button"
         onClick={togglePlayback}
         aria-label={isPlaying ? "Пауза" : "Прослушать запись"}
         title={isPlaying ? "Пауза" : "Прослушать запись"}
-        className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-zinc-100 text-zinc-900 transition hover:bg-white"
+        className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white text-[#050507] shadow-[0_4px_14px_rgba(255,255,255,0.22)] transition active:scale-90"
       >
         {isPlaying ? <PauseIcon className="h-3.5 w-3.5" /> : <PlayIcon className="h-3.5 w-3.5" />}
       </button>
 
-      <span className="h-1 flex-1 overflow-hidden rounded-full bg-zinc-800">
+      <span className="h-1 flex-1 overflow-hidden rounded-full bg-white/10">
         <span
-          className="block h-full rounded-full bg-zinc-400 transition-[width] duration-200"
+          className="block h-full rounded-full bg-white/75 transition-[width] duration-200"
           style={{ width: `${progress}%` }}
         />
       </span>
@@ -1293,12 +1344,12 @@ function TrashList({
 
   if (notes.length === 0) {
     return (
-      <div className="mt-4 rounded-3xl border border-dashed border-zinc-800/70 bg-zinc-900/40 px-6 py-16 text-center backdrop-blur-xl">
+      <div className="surface mt-4 rounded-[28px] border-dashed px-6 py-16 text-center">
         <p aria-hidden className="text-3xl">
           🗑
         </p>
-        <p className="mt-3 text-sm font-medium text-zinc-300">Корзина пуста</p>
-        <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-zinc-500">
+        <p className="mt-3 font-display text-sm font-semibold text-ink">Корзина пуста</p>
+        <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-muted">
           Удалённые заметки появятся здесь — их можно восстановить или стереть навсегда.
         </p>
       </div>
@@ -1312,23 +1363,20 @@ function TrashList({
         const style = categoryStyle(categoryKey(note));
 
         return (
-          <article
-            key={note.id}
-            className="flex flex-col rounded-2xl border border-zinc-800/60 bg-zinc-900/60 p-4 backdrop-blur-xl transition hover:border-zinc-700/70"
-          >
-            <div className="flex items-center gap-2 text-[11px] text-zinc-500">
+          <article key={note.id} className="surface surface-hover flex flex-col p-4">
+            <div className="flex items-center gap-2 text-[11px] text-dim">
               <span aria-hidden>{style.emoji}</span>
               <span className="truncate">{style.title}</span>
-              <span className="ml-auto shrink-0 text-zinc-600">
+              <span className="ml-auto shrink-0 text-dim">
                 удалено {formatNoteTime(note.deleted_at)}
               </span>
             </div>
 
-            <h3 className="mt-2 text-sm font-semibold leading-snug text-zinc-200">
+            <h3 className="mt-2 font-display text-[13.5px] font-semibold leading-snug tracking-tight text-ink">
               {noteTitle(note)}
             </h3>
 
-            <p className="mt-1 line-clamp-3 whitespace-pre-line text-[13px] leading-relaxed text-zinc-500">
+            <p className="mt-1.5 line-clamp-3 whitespace-pre-line text-[13px] leading-relaxed text-muted">
               {noteText(note)}
             </p>
 
@@ -1337,7 +1385,7 @@ function TrashList({
                 type="button"
                 onClick={() => void onRestore(note)}
                 disabled={isPending}
-                className="inline-flex items-center gap-1.5 rounded-full border border-zinc-700/70 bg-zinc-800/70 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:opacity-50"
+                className="btn btn-sm"
               >
                 <RestoreIcon className="h-3.5 w-3.5" />
                 Восстановить
@@ -1346,7 +1394,7 @@ function TrashList({
                 type="button"
                 onClick={() => void onPurge(note)}
                 disabled={isPending}
-                className="inline-flex items-center gap-1.5 rounded-full border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:border-red-500/50 hover:bg-red-500/20 disabled:opacity-50"
+                className="btn btn-sm btn-danger"
               >
                 <TrashIcon className="h-3.5 w-3.5" />
                 Удалить навсегда
@@ -1381,8 +1429,8 @@ function StatusToggle({
       className={cn(
         "grid h-7 w-7 shrink-0 place-items-center rounded-full border transition",
         isDone
-          ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25"
-          : "border-zinc-800/70 bg-zinc-900/70 text-zinc-500 hover:border-emerald-500/40 hover:text-emerald-300",
+          ? "border-[#30d158]/45 bg-[#30d158]/15 text-[#30d158] hover:bg-[#30d158]/25"
+          : "border-stroke bg-white/5 text-dim hover:border-[#30d158]/45 hover:text-[#30d158]",
         isPending && "opacity-50",
       )}
     >
@@ -1410,10 +1458,10 @@ function RecordButton({
       disabled={isProcessing}
       aria-label={isRecording ? "Остановить запись" : "Записать голосовую заметку"}
       className={cn(
-        "inline-flex h-10 shrink-0 items-center gap-2 rounded-full px-3 text-sm font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed sm:px-4",
+        "inline-flex h-10 shrink-0 items-center gap-2 rounded-pill px-3 text-sm font-bold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed sm:px-4",
         isRecording
-          ? "bg-red-500 text-white shadow-lg shadow-red-500/25 focus-visible:outline-red-300"
-          : "bg-zinc-100 text-zinc-900 shadow-lg shadow-black/30 hover:bg-white focus-visible:outline-zinc-300",
+          ? "anim-breathe bg-[#ff453a] text-white shadow-[0_10px_34px_rgba(255,69,58,0.38)] focus-visible:outline-[#ff8f86]"
+          : "bg-white text-[#050507] shadow-[0_8px_28px_rgba(255,255,255,0.16)] hover:shadow-[0_12px_38px_rgba(255,255,255,0.3)] focus-visible:outline-white/60",
         isProcessing && "opacity-70",
       )}
     >
@@ -1528,7 +1576,7 @@ function Spinner({
       aria-hidden="true"
       className={cn(
         "inline-block animate-spin rounded-full border-2",
-        tone === "dark" ? "border-zinc-400/40 border-t-zinc-900" : "border-zinc-600 border-t-zinc-200",
+        tone === "dark" ? "border-black/25 border-t-[#050507]" : "border-white/20 border-t-white/80",
         className ?? "h-4 w-4",
       )}
     />
@@ -1537,11 +1585,11 @@ function Spinner({
 
 function CardSkeleton() {
   return (
-    <div className="animate-pulse rounded-2xl border border-zinc-800/50 bg-zinc-900/60 p-3.5 backdrop-blur-xl">
-      <div className="h-2.5 w-20 rounded-full bg-zinc-800" />
-      <div className="mt-2.5 h-3.5 w-3/4 rounded-full bg-zinc-800" />
-      <div className="mt-2.5 h-2.5 w-full rounded-full bg-zinc-800/70" />
-      <div className="mt-1.5 h-2.5 w-2/3 rounded-full bg-zinc-800/70" />
+    <div className="surface animate-pulse rounded-[18px] p-3.5">
+      <div className="h-2.5 w-20 rounded-full bg-white/10" />
+      <div className="mt-2.5 h-3.5 w-3/4 rounded-full bg-white/10" />
+      <div className="mt-2.5 h-2.5 w-full rounded-full bg-white/[0.07]" />
+      <div className="mt-1.5 h-2.5 w-2/3 rounded-full bg-white/[0.07]" />
     </div>
   );
 }
@@ -1631,3 +1679,407 @@ function PauseIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
+/** «2026-11-09» → «9 ноября»; подпись последней отправки в настройках. */
+function formatSummaryDate(value: string | null): string {
+  if (!value) {
+    return "";
+  }
+
+  const date = new Date(`${value}T12:00:00+03:00`);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+}
+
+/**
+ * Модалка настроек Telegram в стиле iOS: токен бота, chat_id, тумблер ежедневной
+ * отправки и время вечернего отчёта по Москве. «Отправить сейчас» сначала
+ * сохраняет форму, затем дергает крон с `?force=true`.
+ */
+function TelegramSettingsModal({ onClose }: { onClose: () => void }) {
+  const [form, setForm] = useState<TelegramSettingsForm>({
+    bot_token: "",
+    chat_id: "",
+    is_active: false,
+    summary_time: DEFAULT_SUMMARY_TIME,
+  });
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [lastSentDate, setLastSentDate] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const response = await fetch(TELEGRAM_SETTINGS_ENDPOINT, { cache: "no-store" });
+        const payload = (await response.json().catch(() => null)) as TelegramSettingsResponse | null;
+
+        if (!response.ok || !payload || payload.status !== "ok") {
+          throw new Error(
+            payload?.status === "error" ? payload.error : `Сервер ответил HTTP ${response.status}.`,
+          );
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        setForm({
+          bot_token: payload.data.bot_token,
+          chat_id: payload.data.chat_id,
+          is_active: payload.data.is_active,
+          summary_time: payload.data.summary_time || DEFAULT_SUMMARY_TIME,
+        });
+        setLastSentDate(payload.data.last_summary_date);
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(describeRequestError("загрузить настройки Telegram", loadError));
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+
+    const previousOverflow = document.body.style.overflow;
+
+    document.addEventListener("keydown", handleKeyDown);
+    document.body.style.overflow = "hidden";
+
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [onClose]);
+
+  function updateField<K extends keyof TelegramSettingsForm>(
+    key: K,
+    value: TelegramSettingsForm[K],
+  ) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  async function saveSettings(): Promise<TelegramSettings | null> {
+    if (form.is_active && (!form.bot_token.trim() || !form.chat_id.trim())) {
+      setError("Чтобы включить отправку, заполните токен бота и chat_id.");
+      return null;
+    }
+
+    setIsSaving(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const response = await fetch(TELEGRAM_SETTINGS_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      const payload = (await response.json().catch(() => null)) as TelegramSettingsResponse | null;
+
+      if (!response.ok || !payload || payload.status !== "ok") {
+        throw new Error(
+          payload?.status === "error" ? payload.error : `Сервер ответил HTTP ${response.status}.`,
+        );
+      }
+
+      setForm({
+        bot_token: payload.data.bot_token,
+        chat_id: payload.data.chat_id,
+        is_active: payload.data.is_active,
+        summary_time: payload.data.summary_time,
+      });
+      setLastSentDate(payload.data.last_summary_date);
+
+      return payload.data;
+    } catch (saveError) {
+      setError(describeRequestError("сохранить настройки", saveError));
+      return null;
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function handleSave() {
+    const saved = await saveSettings();
+
+    if (saved) {
+      setNotice("Настройки сохранены.");
+    }
+  }
+
+  async function sendNow() {
+    if (!form.bot_token.trim() || !form.chat_id.trim()) {
+      setError("Заполните токен бота и chat_id — без них отчёт некуда отправлять.");
+      return;
+    }
+
+    setIsSending(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const saved = await saveSettings();
+
+      if (!saved) {
+        return;
+      }
+
+      const response = await fetch(`${DAILY_SUMMARY_ENDPOINT}?force=true`, { cache: "no-store" });
+      const payload = (await response.json().catch(() => null)) as DailySummaryResponse | null;
+
+      if (!response.ok || !payload || payload.status === "error") {
+        throw new Error(
+          payload?.status === "error" ? payload.error : `Сервер ответил HTTP ${response.status}.`,
+        );
+      }
+
+      if (payload.status === "skipped") {
+        setError(payload.detail ?? SUMMARY_SKIP_TEXT[payload.reason] ?? "Отправка пропущена.");
+        return;
+      }
+
+      setNotice(`Отчёт отправлен: ${payload.data.notes} заметок за ${payload.data.date}.`);
+    } catch (sendError) {
+      setError(describeRequestError("отправить отчёт", sendError));
+    } finally {
+      setIsSending(false);
+    }
+  }
+
+  return (
+    <div className="ovl">
+      <button
+        type="button"
+        aria-label="Закрыть настройки"
+        onClick={onClose}
+        className="absolute inset-0 h-full w-full cursor-default"
+      />
+
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="telegram-settings-title"
+        className="sheet"
+      >
+        <div className="grab" aria-hidden>
+          <i />
+        </div>
+
+        <div
+          aria-hidden
+          className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-[#0a84ff]/70 via-transparent to-transparent"
+        />
+
+        <div className="flex items-start gap-3 pt-1">
+          <div className="min-w-0 flex-1 pr-8">
+            <h2
+              id="telegram-settings-title"
+              className="font-display text-[17px] font-semibold tracking-tight text-ink"
+            >
+              Настройки Telegram
+            </h2>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted">
+              Ежедневный дайджест заметок — по московскому времени.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Закрыть настройки"
+            className="sheet-x"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="no-scrollbar max-h-[70dvh] overflow-y-auto pt-4">
+          {isLoading ? (
+            <div className="flex items-center gap-2 py-10 text-xs text-muted">
+              <Spinner className="h-4 w-4" /> Загружаем настройки…
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3.5">
+              <label className="flex flex-col gap-1.5">
+                <span className="field-label">Токен бота</span>
+                <input
+                  type="password"
+                  value={form.bot_token}
+                  onChange={(event) => updateField("bot_token", event.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="123456789:AA…"
+                  className="input font-mono text-[13px]"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1.5">
+                <span className="field-label">Chat ID</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={form.chat_id}
+                  onChange={(event) => updateField("chat_id", event.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="123456789"
+                  className="input font-mono text-[13px]"
+                />
+                <span className="hint">Свой ID можно узнать у @userinfobot.</span>
+              </label>
+
+              <div className="glass-lite flex items-center gap-3 rounded-[18px] px-3.5 py-3">
+                <div className="min-w-0 flex-1">
+                  <p className="text-[13px] font-semibold text-ink">Отправлять ежедневный отчёт</p>
+                  <p className="mt-0.5 text-[11px] text-muted">
+                    {lastSentDate
+                      ? `Последняя отправка: ${formatSummaryDate(lastSentDate)}`
+                      : "Сегодня ещё не отправляли"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={form.is_active}
+                  aria-label="Отправлять ежедневный отчёт"
+                  onClick={() => updateField("is_active", !form.is_active)}
+                  className={cn("switch", form.is_active && "switch-on")}
+                >
+                  <span className="switch-knob" />
+                </button>
+              </div>
+
+              <label className="flex flex-col gap-1.5">
+                <span className="field-label">Время вечернего отчета (МСК)</span>
+                <input
+                  type="time"
+                  step={300}
+                  value={form.summary_time}
+                  onChange={(event) =>
+                    updateField("summary_time", event.target.value || DEFAULT_SUMMARY_TIME)
+                  }
+                  className="input tabular-nums sm:w-40"
+                />
+                <span className="hint">
+                  Крон проверяет расписание каждые 30 минут и отправляет отчёт после указанного
+                  времени.
+                </span>
+              </label>
+
+              {error ? (
+                <p
+                  role="alert"
+                  className="rounded-[14px] border border-[#ff453a]/30 bg-[#ff453a]/10 px-3 py-2 text-[11px] leading-relaxed text-[#ffb3ae]"
+                >
+                  {error}
+                </p>
+              ) : null}
+
+              {notice ? (
+                <p
+                  role="status"
+                  className="rounded-[14px] border border-[#30d158]/30 bg-[#30d158]/10 px-3 py-2 text-[11px] leading-relaxed text-[#7ee6a0]"
+                >
+                  {notice}
+                </p>
+              ) : null}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-1 flex flex-col gap-2 border-t border-stroke pt-3.5 sm:flex-row sm:items-center">
+          <button
+            type="button"
+            onClick={() => void sendNow()}
+            disabled={isLoading || isSaving || isSending}
+            className="btn btn-sm"
+          >
+            {isSending ? (
+              <Spinner className="h-3.5 w-3.5" />
+            ) : (
+              <SendIcon className="h-3.5 w-3.5" />
+            )}
+            Отправить сейчас
+          </button>
+
+          <div className="flex items-center gap-2 sm:ml-auto">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-pill px-4 py-2 text-xs font-bold text-muted transition hover:text-ink"
+            >
+              Отмена
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleSave()}
+              disabled={isLoading || isSaving || isSending}
+              className="btn btn-sm btn-prime"
+            >
+              {isSaving ? <Spinner tone="dark" className="h-3.5 w-3.5" /> : null}
+              Сохранить
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className={className ?? "h-4 w-4"}
+    >
+      <circle cx="12" cy="12" r="3.2" />
+      <path d="M19.4 13.5a7.6 7.6 0 0 0 0-3l1.7-1.2-1.8-3.1-2 .8a7.7 7.7 0 0 0-2.6-1.5L14.4 3h-3.6l-.3 2.5a7.7 7.7 0 0 0-2.6 1.5l-2-.8-1.8 3.1 1.7 1.2a7.6 7.6 0 0 0 0 3l-1.7 1.2 1.8 3.1 2-.8a7.7 7.7 0 0 0 2.6 1.5l.3 2.5h3.6l.3-2.5a7.7 7.7 0 0 0 2.6-1.5l2 .8 1.8-3.1-1.7-1.2Z" />
+    </svg>
+  );
+}
+
+function SendIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className={className ?? "h-4 w-4"}
+    >
+      <path d="M21 3 10.5 13.5" />
+      <path d="M21 3l-6.5 18-4-7.5L3 9.5 21 3Z" />
+    </svg>
+  );
+}
+

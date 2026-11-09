@@ -23,8 +23,24 @@ export function errorMessage(error: unknown): string {
 
 /** Подсказка про миграцию, если в таблице нет новых колонок. */
 export function describeMissingColumn(message: string): string {
-  if (/column .* does not exist/i.test(message)) {
-    return `В таблице voice_notes нет нужной колонки: ${message}. Примените миграцию (subcategory, deleted_at) из README.`;
+  if (!/column .* does not exist/i.test(message)) {
+    return message;
+  }
+
+  if (/app_settings/i.test(message)) {
+    return `В таблице app_settings нет нужной колонки: ${message}. Примените SQL из README (summary_time, last_summary_date).`;
+  }
+
+  return `В таблице voice_notes нет нужной колонки: ${message}. Примените миграцию (subcategory, deleted_at) из README.`;
+}
+
+/** Подсказка про SQL, если в базе ещё нет таблицы настроек. */
+export function describeMissingRelation(message: string): string {
+  const mentionsSettings = /app_settings/i.test(message);
+  const looksMissing = /does not exist|could not find the table|schema cache/i.test(message);
+
+  if (mentionsSettings && looksMissing) {
+    return `В базе нет таблицы app_settings: ${message}. Создайте её по SQL из README.`;
   }
 
   return message;
